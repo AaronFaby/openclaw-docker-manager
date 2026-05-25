@@ -1,0 +1,768 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly VERSION="1.0.0"
+readonly SCRIPT_NAME="ocm"
+
+# ---- Resolve OCM_DIR (symlink-safe) ----
+_ocm_dir() {
+    local source="${BASH_SOURCE[0]}"
+    while [ -L "$source" ]; do
+        local dir
+        dir="$(cd -P "$(dirname "$source")" && pwd)"
+        source="$(readlink "$source")"
+        [[ "$source" != /* ]] && source="$dir/$source"
+    done
+    cd -P "$(dirname "$source")" && pwd
+}
+
+readonly OCM_DIR="$(_ocm_dir)"
+
+# ---- Color / Output ----
+_supports_color() {
+    [ -t 1 ] && [ -z "${NO_COLOR:-}" ]
+}
+
+if _supports_color; then
+    readonly RED='\033[0;31m'
+    readonly GREEN='\033[0;32m'
+    readonly YELLOW='\033[0;33m'
+    readonly BLUE='\033[0;34m'
+    readonly CYAN='\033[0;36m'
+    readonly BOLD='\033[1m'
+    readonly DIM='\033[2m'
+    readonly RESET='\033[0m'
+else
+    readonly RED='' GREEN='' YELLOW='' BLUE='' CYAN='' BOLD='' DIM='' RESET=''
+fi
+
+_info()    { printf "${BLUE}info:${RESET} %s\n" "$*"; }
+_success() { printf "${GREEN}ok:${RESET} %s\n" "$*"; }
+_warn()    { printf "${YELLOW}warn:${RESET} %s\n" "$*" >&2; }
+_error()   { printf "${RED}error:${RESET} %s\n" "$*" >&2; }
+_die()     { _error "$@"; exit 1; }
+
+# ---- Cleanup ----
+_TMP_FILES=()
+_cleanup() {
+    if [ ${#_TMP_FILES[@]} -gt 0 ]; then
+        for f in "${_TMP_FILES[@]}"; do
+            rm -f "$f" 2>/dev/null || true
+        done
+    fi
+}
+trap _cleanup EXIT
+
+# ---- Initialization ----
+_ensure_init() {
+    if [ ! -f "$OCM_DIR/ocm.conf" ]; then
+        cat > "$OCM_DIR/ocm.conf" <<'CONF'
+OCM_IMAGE=ghcr.io/aaronfaby/openclaw-custom
+OCM_DEFAULT_TAG=latest
+OCM_PORT_START=18789
+OCM_CONTAINER_PREFIX=ocm
+CONF
+        _info "Created default config at ocm.conf"
+    fi
+    mkdir -p "$OCM_DIR/containers"
+}
+
+_load_config() {
+    OCM_IMAGE="${OCM_IMAGE:-ghcr.io/aaronfaby/openclaw-custom}"
+    OCM_DEFAULT_TAG="${OCM_DEFAULT_TAG:-latest}"
+    OCM_PORT_START="${OCM_PORT_START:-18789}"
+    OCM_CONTAINER_PREFIX="${OCM_CONTAINER_PREFIX:-ocm}"
+
+    if [ -f "$OCM_DIR/ocm.conf" ]; then
+        # shellcheck source=/dev/null
+        source "$OCM_DIR/ocm.conf"
+    fi
+}
+
+# ---- Validation ----
+_validate_name() {
+    local name="$1"
+    if [ -z "$name" ]; then
+        _die "Container name is required."
+    fi
+    if ! [[ "$name" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,62}[a-zA-Z0-9])?$ ]]; then
+        _die "Invalid container name '$name'. Use alphanumeric characters and hyphens (1-64 chars, must start/end with alphanumeric)."
+    fi
+}
+
+_require_docker() {
+    if ! docker info >/dev/null 2>&1; then
+        _die "Docker is not running. Please start Docker and try again."
+    fi
+}
+
+_require_config() {
+    local name="$1"
+    if [ ! -f "$OCM_DIR/containers/${name}.env" ]; then
+        _die "Container '$name' not found. Run '${SCRIPT_NAME} list' to see managed containers."
+    fi
+}
+
+# ---- Container name ----
+_container_name() {
+    echo "${OCM_CONTAINER_PREFIX}-${1}"
+}
+
+# ---- Port helpers ----
+_next_available_port() {
+    local max_port=$((OCM_PORT_START - 1))
+    if [ -d "$OCM_DIR/containers" ]; then
+        for env_file in "$OCM_DIR/containers"/*.env; do
+            [ -f "$env_file" ] || continue
+            local port
+            port=$(grep -E '^OCM_PORT=' "$env_file" 2>/dev/null | cut -d= -f2 | tr -d '[:space:]')
+            if [ -n "$port" ] && [ "$port" -gt "$max_port" ] 2>/dev/null; then
+                max_port="$port"
+            fi
+        done
+    fi
+    echo $((max_port + 1))
+}
+
+_port_in_use() {
+    local port="$1" name="${2:-}"
+    if [ -d "$OCM_DIR/containers" ]; then
+        for env_file in "$OCM_DIR/containers"/*.env; do
+            [ -f "$env_file" ] || continue
+            local file_name
+            file_name=$(basename "$env_file" .env)
+            [ "$file_name" = "$name" ] && continue
+            local p
+            p=$(grep -E '^OCM_PORT=' "$env_file" 2>/dev/null | cut -d= -f2 | tr -d '[:space:]')
+            if [ "$p" = "$port" ]; then
+                echo "$file_name"
+                return 0
+            fi
+        done
+    fi
+    return 1
+}
+
+# ---- Container state ----
+_container_state() {
+    local cname
+    cname="$(_container_name "$1")"
+    local state
+    state=$(docker inspect --format '{{.State.Status}}' "$cname" 2>/dev/null) || true
+    echo "${state:-absent}"
+}
+
+_container_exists() {
+    local cname
+    cname="$(_container_name "$1")"
+    docker inspect "$cname" >/dev/null 2>&1
+}
+
+# ---- Tag resolution ----
+_effective_tag() {
+    local name="$1"
+    local tag=""
+    if [ -f "$OCM_DIR/containers/${name}.env" ]; then
+        tag=$(grep -E '^OCM_TAG=' "$OCM_DIR/containers/${name}.env" 2>/dev/null | cut -d= -f2 | tr -d '[:space:]')
+    fi
+    echo "${tag:-$OCM_DEFAULT_TAG}"
+}
+
+# ---- Filtered env file ----
+_filtered_env_file() {
+    local name="$1"
+    local tmp
+    tmp=$(mktemp)
+    _TMP_FILES+=("$tmp")
+    grep -vE '(^#|^$|^OCM_)' "$OCM_DIR/containers/${name}.env" > "$tmp" 2>/dev/null || true
+    echo "$tmp"
+}
+
+# ---- Docker run ----
+_docker_run() {
+    local name="$1"
+    local cname
+    cname="$(_container_name "$name")"
+    local tag
+    tag="$(_effective_tag "$name")"
+    local port
+    port=$(grep -E '^OCM_PORT=' "$OCM_DIR/containers/${name}.env" | cut -d= -f2 | tr -d '[:space:]')
+    local env_file
+    env_file="$(_filtered_env_file "$name")"
+
+    local image="${OCM_IMAGE}:${tag}"
+
+    if ! docker image inspect "$image" >/dev/null 2>&1; then
+        _info "Image '$image' not found locally, pulling..."
+        docker pull "$image" || _die "Failed to pull image '$image'."
+    fi
+
+    if ! docker run -d \
+        --name "$cname" \
+        --hostname "$name" \
+        -p "${port}:18789" \
+        -v "${OCM_CONTAINER_PREFIX}-${name}-config:/home/node/.openclaw" \
+        -v "${OCM_CONTAINER_PREFIX}-${name}-workspace:/home/node/.openclaw/workspace" \
+        -v "${OCM_CONTAINER_PREFIX}-${name}-auth:/home/node/.config/openclaw" \
+        --env-file "$env_file" \
+        --restart unless-stopped \
+        "$image" >/dev/null 2>&1; then
+        docker rm "$cname" >/dev/null 2>&1 || true
+        _die "Failed to start container '$name' on port ${port}. The port may be in use. Try: ${SCRIPT_NAME} env $name"
+    fi
+}
+
+# ============================================================
+# Commands
+# ============================================================
+
+cmd_create() {
+    local name="" tag="" port=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --tag)  tag="${2:?'--tag requires a value'}"; shift 2 ;;
+            --port) port="${2:?'--port requires a value'}"; shift 2 ;;
+            -*)     _die "Unknown option: $1" ;;
+            *)
+                [ -z "$name" ] && name="$1" || _die "Unexpected argument: $1"
+                shift
+                ;;
+        esac
+    done
+
+    [ -z "$name" ] && _die "Usage: ${SCRIPT_NAME} create <name> [--tag TAG] [--port PORT]"
+    _validate_name "$name"
+    _require_docker
+
+    if [ -f "$OCM_DIR/containers/${name}.env" ]; then
+        _die "Container '$name' already exists. Use '${SCRIPT_NAME} env $name' to edit its configuration."
+    fi
+
+    if [ -z "$port" ]; then
+        port=$(_next_available_port)
+    else
+        if ! [[ "$port" =~ ^[0-9]+$ ]]; then
+            _die "Port must be a number."
+        fi
+        local conflict
+        conflict=$(_port_in_use "$port" "$name") && _die "Port $port is already assigned to container '$conflict'."
+    fi
+
+    tag="${tag:-$OCM_DEFAULT_TAG}"
+
+    cat > "$OCM_DIR/containers/${name}.env" <<EOF
+# Container configuration for: ${name}
+# Managed by ${SCRIPT_NAME} - edit with: ${SCRIPT_NAME} env ${name}
+
+# --- OCM internal (do not remove) ---
+OCM_PORT=${port}
+OCM_TAG=${tag}
+
+# --- User environment variables ---
+# ANTHROPIC_API_KEY=
+# XAI_API_KEY=
+# OPENAI_API_KEY=
+# OPENCLAW_LOG_LEVEL=debug
+EOF
+
+    docker volume create "${OCM_CONTAINER_PREFIX}-${name}-config" >/dev/null
+    docker volume create "${OCM_CONTAINER_PREFIX}-${name}-workspace" >/dev/null
+    docker volume create "${OCM_CONTAINER_PREFIX}-${name}-auth" >/dev/null
+
+    _success "Created container '$name' (port ${port}, tag ${tag})"
+    _info "Edit environment: ${SCRIPT_NAME} env ${name}"
+    _info "Start container:  ${SCRIPT_NAME} start ${name}"
+}
+
+cmd_start() {
+    local name="${1:-}"
+    [ -z "$name" ] && _die "Usage: ${SCRIPT_NAME} start <name>"
+    _validate_name "$name"
+    _require_docker
+    _require_config "$name"
+
+    local state
+    state=$(_container_state "$name")
+    local cname
+    cname="$(_container_name "$name")"
+
+    case "$state" in
+        running|restarting)
+            _info "Container '$name' is already running."
+            return 0
+            ;;
+        paused)
+            docker unpause "$cname" >/dev/null
+            _success "Unpaused container '$name'."
+            return 0
+            ;;
+        absent)
+            _docker_run "$name"
+            ;;
+        *)
+            docker stop "$cname" >/dev/null 2>&1 || true
+            docker rm "$cname" >/dev/null 2>&1 || true
+            _docker_run "$name"
+            ;;
+    esac
+
+    local port
+    port=$(grep -E '^OCM_PORT=' "$OCM_DIR/containers/${name}.env" | cut -d= -f2 | tr -d '[:space:]')
+    _success "Started container '$name' on port ${port}."
+}
+
+cmd_stop() {
+    local name="${1:-}"
+    [ -z "$name" ] && _die "Usage: ${SCRIPT_NAME} stop <name>"
+    _validate_name "$name"
+    _require_docker
+    _require_config "$name"
+
+    local state
+    state=$(_container_state "$name")
+    local cname
+    cname="$(_container_name "$name")"
+
+    if [ "$state" = "absent" ] || [ "$state" = "exited" ]; then
+        _info "Container '$name' is not running."
+        return 0
+    fi
+
+    docker stop "$cname" >/dev/null
+    _success "Stopped container '$name'."
+}
+
+cmd_restart() {
+    local name="${1:-}"
+    [ -z "$name" ] && _die "Usage: ${SCRIPT_NAME} restart <name>"
+    _validate_name "$name"
+    _require_docker
+    _require_config "$name"
+
+    local state
+    state=$(_container_state "$name")
+    local cname
+    cname="$(_container_name "$name")"
+
+    if [ "$state" != "absent" ]; then
+        docker stop "$cname" >/dev/null 2>&1 || true
+        docker rm "$cname" >/dev/null 2>&1 || true
+    fi
+
+    _docker_run "$name"
+
+    local port
+    port=$(grep -E '^OCM_PORT=' "$OCM_DIR/containers/${name}.env" | cut -d= -f2 | tr -d '[:space:]')
+    _success "Restarted container '$name' on port ${port}."
+}
+
+cmd_upgrade() {
+    local names=() tag="" all=false
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --all)  all=true; shift ;;
+            --tag)  tag="${2:?'--tag requires a value'}"; shift 2 ;;
+            -*)     _die "Unknown option: $1" ;;
+            *)      names+=("$1"); shift ;;
+        esac
+    done
+
+    _require_docker
+
+    if $all; then
+        [ ${#names[@]} -gt 0 ] && _die "Cannot combine --all with container names."
+        for env_file in "$OCM_DIR/containers"/*.env; do
+            [ -f "$env_file" ] || continue
+            names+=("$(basename "$env_file" .env)")
+        done
+        [ ${#names[@]} -eq 0 ] && _die "No containers to upgrade. Create one with '${SCRIPT_NAME} create <name>'."
+    fi
+
+    [ ${#names[@]} -eq 0 ] && _die "Usage: ${SCRIPT_NAME} upgrade <name> [--tag TAG] or ${SCRIPT_NAME} upgrade --all"
+
+    for name in "${names[@]}"; do
+        _validate_name "$name"
+        _require_config "$name"
+    done
+
+    local pull_tag="${tag:-$OCM_DEFAULT_TAG}"
+    _info "Pulling image ${OCM_IMAGE}:${pull_tag}..."
+    docker pull "${OCM_IMAGE}:${pull_tag}" || _die "Failed to pull image."
+    _success "Image pulled."
+
+    for name in "${names[@]}"; do
+        local cname
+        cname="$(_container_name "$name")"
+
+        if [ -n "$tag" ]; then
+            sed -i.bak "s/^OCM_TAG=.*/OCM_TAG=${tag}/" "$OCM_DIR/containers/${name}.env"
+            rm -f "$OCM_DIR/containers/${name}.env.bak"
+        fi
+
+        local state
+        state=$(_container_state "$name")
+
+        if [ "$state" != "absent" ]; then
+            docker stop "$cname" >/dev/null 2>&1 || true
+            docker rm "$cname" >/dev/null 2>&1 || true
+        fi
+
+        _docker_run "$name"
+
+        local effective
+        effective=$(_effective_tag "$name")
+        _success "Upgraded '$name' to ${OCM_IMAGE}:${effective}"
+    done
+}
+
+cmd_logs() {
+    local name="" follow=false tail="100"
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -f|--follow) follow=true; shift ;;
+            -n|--tail)   tail="${2:?'--tail requires a value'}"; shift 2 ;;
+            -*)          _die "Unknown option: $1" ;;
+            *)
+                [ -z "$name" ] && name="$1" || _die "Unexpected argument: $1"
+                shift
+                ;;
+        esac
+    done
+
+    [ -z "$name" ] && _die "Usage: ${SCRIPT_NAME} logs <name> [-f] [-n LINES]"
+    _validate_name "$name"
+    _require_docker
+    _require_config "$name"
+
+    local cname
+    cname="$(_container_name "$name")"
+
+    if ! _container_exists "$name"; then
+        _die "Container '$name' has not been started yet. Run '${SCRIPT_NAME} start $name' first."
+    fi
+
+    local args=(--tail "$tail")
+    $follow && args+=(--follow)
+
+    exec docker logs "${args[@]}" "$cname"
+}
+
+cmd_cli() {
+    local name="${1:-}"
+    [ -z "$name" ] && _die "Usage: ${SCRIPT_NAME} cli <name> [--raw] [cmd...]"
+    _validate_name "$name"
+    shift
+    _require_docker
+    _require_config "$name"
+
+    local state
+    state=$(_container_state "$name")
+
+    if [ "$state" != "running" ] && [ "$state" != "restarting" ]; then
+        _die "Container '$name' is not running. Start it with '${SCRIPT_NAME} start $name'."
+    fi
+
+    local cname
+    cname="$(_container_name "$name")"
+
+    if [ $# -eq 0 ]; then
+        exec docker exec -it "$cname" /bin/bash
+    elif [ "$1" = "--raw" ]; then
+        shift
+        [ $# -eq 0 ] && _die "Usage: ${SCRIPT_NAME} cli <name> --raw <command...>"
+        exec docker exec -it "$cname" "$@"
+    else
+        exec docker exec -it "$cname" node openclaw.mjs "$@"
+    fi
+}
+
+cmd_status() {
+    local name="${1:-}"
+    _require_docker
+
+    if [ -z "$name" ]; then
+        cmd_list
+        return
+    fi
+
+    _validate_name "$name"
+    _require_config "$name"
+
+    local cname
+    cname="$(_container_name "$name")"
+    local tag
+    tag=$(_effective_tag "$name")
+    local port
+    port=$(grep -E '^OCM_PORT=' "$OCM_DIR/containers/${name}.env" | cut -d= -f2 | tr -d '[:space:]')
+
+    local state
+    state=$(_container_state "$name")
+
+    printf "\n"
+    printf "  ${BOLD}Container:${RESET}  %s\n" "$name"
+    printf "  ${BOLD}Docker:${RESET}     %s\n" "$cname"
+    printf "  ${BOLD}Image:${RESET}      %s:%s\n" "$OCM_IMAGE" "$tag"
+    printf "  ${BOLD}Port:${RESET}       %s → 18789\n" "$port"
+
+    case "$state" in
+        running)
+            printf "  ${BOLD}Status:${RESET}     ${GREEN}running${RESET}\n"
+            ;;
+        restarting)
+            printf "  ${BOLD}Status:${RESET}     ${YELLOW}restarting${RESET}\n"
+            ;;
+        exited)
+            printf "  ${BOLD}Status:${RESET}     ${RED}stopped${RESET}\n"
+            local finished
+            finished=$(docker inspect --format '{{.State.FinishedAt}}' "$cname" 2>/dev/null)
+            printf "  ${BOLD}Stopped:${RESET}    %s\n" "$finished"
+            ;;
+        absent)
+            printf "  ${BOLD}Status:${RESET}     ${DIM}not created${RESET}\n"
+            ;;
+        *)
+            printf "  ${BOLD}Status:${RESET}     %s\n" "$state"
+            ;;
+    esac
+
+    if [ "$state" != "absent" ] && [ "$state" != "exited" ]; then
+        local health
+        health=$(docker inspect --format '{{.State.Health.Status}}' "$cname" 2>/dev/null) || health="none"
+        case "$health" in
+            healthy)   printf "  ${BOLD}Health:${RESET}     ${GREEN}healthy${RESET}\n" ;;
+            unhealthy) printf "  ${BOLD}Health:${RESET}     ${RED}unhealthy${RESET}\n" ;;
+            starting)  printf "  ${BOLD}Health:${RESET}     ${YELLOW}starting${RESET}\n" ;;
+            *)         printf "  ${BOLD}Health:${RESET}     %s\n" "$health" ;;
+        esac
+
+        local started
+        started=$(docker inspect --format '{{.State.StartedAt}}' "$cname" 2>/dev/null)
+        printf "  ${BOLD}Started:${RESET}    %s\n" "$started"
+    fi
+
+    printf "  ${BOLD}Volumes:${RESET}    %s-config\n" "${OCM_CONTAINER_PREFIX}-${name}"
+    printf "              %s-workspace\n" "${OCM_CONTAINER_PREFIX}-${name}"
+    printf "              %s-auth\n" "${OCM_CONTAINER_PREFIX}-${name}"
+    printf "\n"
+}
+
+cmd_list() {
+    _require_docker
+
+    local configs=()
+    for env_file in "$OCM_DIR/containers"/*.env; do
+        [ -f "$env_file" ] || continue
+        configs+=("$(basename "$env_file" .env)")
+    done
+
+    if [ ${#configs[@]} -eq 0 ]; then
+        _info "No containers managed by ${SCRIPT_NAME}. Run '${SCRIPT_NAME} create <name>' to get started."
+        return 0
+    fi
+
+    printf "\n"
+    printf "  ${BOLD}%-16s %-12s %-8s %-20s %-10s${RESET}\n" "NAME" "STATUS" "PORT" "IMAGE TAG" "HEALTH"
+
+    for name in "${configs[@]}"; do
+        local state
+        state=$(_container_state "$name")
+        local port
+        port=$(grep -E '^OCM_PORT=' "$OCM_DIR/containers/${name}.env" | cut -d= -f2 | tr -d '[:space:]')
+        local tag
+        tag=$(_effective_tag "$name")
+        local health="-"
+
+        local status_str
+        case "$state" in
+            running)
+                status_str="${GREEN}running${RESET}"
+                ;;
+            restarting)
+                status_str="${YELLOW}restarting${RESET}"
+                ;;
+            exited)   status_str="${RED}stopped${RESET}" ;;
+            absent)   status_str="${DIM}not created${RESET}" ;;
+            *)        status_str="$state" ;;
+        esac
+
+        if [ "$state" != "absent" ] && [ "$state" != "exited" ]; then
+            local cname
+            cname="$(_container_name "$name")"
+            health=$(docker inspect --format '{{.State.Health.Status}}' "$cname" 2>/dev/null) || health="-"
+        fi
+
+        printf "  %-16s %-22b %-8s %-20s %-10s\n" "$name" "$status_str" "$port" "$tag" "$health"
+    done
+    printf "\n"
+}
+
+cmd_rm() {
+    local name="" volumes=false force=false
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --volumes) volumes=true; shift ;;
+            --force|-f) force=true; shift ;;
+            -*)        _die "Unknown option: $1" ;;
+            *)
+                [ -z "$name" ] && name="$1" || _die "Unexpected argument: $1"
+                shift
+                ;;
+        esac
+    done
+
+    [ -z "$name" ] && _die "Usage: ${SCRIPT_NAME} rm <name> [--volumes] [--force]"
+    _validate_name "$name"
+    _require_docker
+    _require_config "$name"
+
+    local cname
+    cname="$(_container_name "$name")"
+    local state
+    state=$(_container_state "$name")
+
+    if [ "$state" = "running" ] || [ "$state" = "restarting" ]; then
+        if $force; then
+            docker stop "$cname" >/dev/null 2>&1 || true
+        else
+            _die "Container '$name' is running. Stop it first or use --force."
+        fi
+    fi
+
+    if [ "$state" != "absent" ]; then
+        docker rm "$cname" >/dev/null 2>&1 || true
+    fi
+
+    if $volumes; then
+        printf "${YELLOW}This will permanently delete all data for '$name'. Continue? [y/N]${RESET} "
+        read -r confirm
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            docker volume rm "${OCM_CONTAINER_PREFIX}-${name}-config" 2>/dev/null || true
+            docker volume rm "${OCM_CONTAINER_PREFIX}-${name}-workspace" 2>/dev/null || true
+            docker volume rm "${OCM_CONTAINER_PREFIX}-${name}-auth" 2>/dev/null || true
+            _info "Volumes removed."
+        else
+            _info "Volumes preserved."
+        fi
+    fi
+
+    rm -f "$OCM_DIR/containers/${name}.env"
+    _success "Removed container '$name'."
+}
+
+cmd_env() {
+    local name="${1:-}"
+    [ -z "$name" ] && _die "Usage: ${SCRIPT_NAME} env <name>"
+    _validate_name "$name"
+    _require_config "$name"
+
+    local editor="${EDITOR:-vi}"
+    "$editor" "$OCM_DIR/containers/${name}.env"
+
+    local state
+    state=$(_container_state "$name" 2>/dev/null) || state="absent"
+    if [ "$state" = "running" ]; then
+        _info "Restart the container for changes to take effect: ${SCRIPT_NAME} restart $name"
+    fi
+}
+
+cmd_pull() {
+    local tag="${1:-$OCM_DEFAULT_TAG}"
+    _require_docker
+
+    _info "Pulling ${OCM_IMAGE}:${tag}..."
+    docker pull "${OCM_IMAGE}:${tag}" || _die "Failed to pull image."
+    _success "Image pulled: ${OCM_IMAGE}:${tag}"
+
+    if [ "$tag" != "$OCM_DEFAULT_TAG" ]; then
+        printf "Set '${tag}' as the default tag? [y/N] "
+        read -r confirm
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            if [[ "$OSTYPE" == "darwin"* ]]; then
+                sed -i '' "s/^OCM_DEFAULT_TAG=.*/OCM_DEFAULT_TAG=${tag}/" "$OCM_DIR/ocm.conf"
+            else
+                sed -i "s/^OCM_DEFAULT_TAG=.*/OCM_DEFAULT_TAG=${tag}/" "$OCM_DIR/ocm.conf"
+            fi
+            _success "Default tag set to '${tag}'."
+        fi
+    fi
+}
+
+cmd_help() {
+    cat <<EOF
+${BOLD}${SCRIPT_NAME}${RESET} - OpenClaw Docker Manager v${VERSION}
+
+${BOLD}Usage:${RESET}
+  ${SCRIPT_NAME} <command> [options]
+
+${BOLD}Container Lifecycle:${RESET}
+  create <name> [--tag TAG] [--port PORT]   Create a new container configuration
+  start <name>                              Start a container
+  stop <name>                               Stop a container
+  restart <name>                            Restart a container
+  rm <name> [--volumes] [--force]           Remove a container
+
+${BOLD}Management:${RESET}
+  list, ls                                  List all managed containers
+  status [name]                             Show container status
+  logs <name> [-f] [-n LINES]              View container logs
+  cli <name> [--raw] [cmd...]              Execute commands in a container
+  env <name>                                Edit container environment variables
+
+${BOLD}Image:${RESET}
+  pull [tag]                                Pull the latest image
+  upgrade <name> [--tag TAG]                Upgrade a container to the latest image
+  upgrade --all [--tag TAG]                 Upgrade all containers
+
+${BOLD}Other:${RESET}
+  help                                      Show this help
+  version                                   Show version
+
+${BOLD}Examples:${RESET}
+  ${SCRIPT_NAME} create main                        Create container 'main' with defaults
+  ${SCRIPT_NAME} env main                           Set API keys and environment
+  ${SCRIPT_NAME} start main                         Start the container
+  ${SCRIPT_NAME} cli main                           Open a shell in the container
+  ${SCRIPT_NAME} cli main configure                 Run 'openclaw configure' inside
+  ${SCRIPT_NAME} upgrade --all                      Upgrade all containers to latest
+EOF
+}
+
+cmd_version() {
+    echo "${SCRIPT_NAME} v${VERSION}"
+}
+
+# ============================================================
+# Main dispatch
+# ============================================================
+
+main() {
+    _ensure_init
+    _load_config
+
+    local cmd="${1:-help}"
+    shift 2>/dev/null || true
+
+    case "$cmd" in
+        create)            cmd_create "$@" ;;
+        start)             cmd_start "$@" ;;
+        stop)              cmd_stop "$@" ;;
+        restart)           cmd_restart "$@" ;;
+        upgrade)           cmd_upgrade "$@" ;;
+        logs)              cmd_logs "$@" ;;
+        cli|exec|shell)    cmd_cli "$@" ;;
+        status)            cmd_status "$@" ;;
+        list|ls)           cmd_list "$@" ;;
+        rm|remove|delete)  cmd_rm "$@" ;;
+        env)               cmd_env "$@" ;;
+        pull)              cmd_pull "$@" ;;
+        help|--help|-h)    cmd_help ;;
+        version|--version) cmd_version ;;
+        *)                 _error "Unknown command: $cmd"; cmd_help; exit 1 ;;
+    esac
+}
+
+main "$@"

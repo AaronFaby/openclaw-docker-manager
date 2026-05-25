@@ -1,0 +1,8 @@
+# Per-container env files (contain API keys)
+containers/*.env
+
+# Auto-generated global config
+ocm.conf
+
+# Claude Code local config
+.claude/
