@@ -103,6 +103,22 @@ _require_config() {
     fi
 }
 
+_validate_tag() {
+    local tag="$1"
+    if [ -z "$tag" ]; then
+        _die "Tag cannot be empty."
+    fi
+    if ! [[ "$tag" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$ ]]; then
+        _die "Invalid tag '$tag'. Use alphanumeric characters, dots, hyphens, and underscores (max 128 chars)."
+    fi
+}
+
+# ---- Env file helpers ----
+_get_port() {
+    local name="$1"
+    grep -E '^OCM_PORT=' "$OCM_DIR/containers/${name}.env" | cut -d= -f2 | tr -d '[:space:]'
+}
+
 # ---- Container name ----
 _container_name() {
     echo "${OCM_CONTAINER_PREFIX}-${1}"
@@ -114,8 +130,10 @@ _next_available_port() {
     if [ -d "$OCM_DIR/containers" ]; then
         for env_file in "$OCM_DIR/containers"/*.env; do
             [ -f "$env_file" ] || continue
+            local file_name
+            file_name=$(basename "$env_file" .env)
             local port
-            port=$(grep -E '^OCM_PORT=' "$env_file" 2>/dev/null | cut -d= -f2 | tr -d '[:space:]')
+            port=$(_get_port "$file_name")
             if [ -n "$port" ] && [ "$port" -gt "$max_port" ] 2>/dev/null; then
                 max_port="$port"
             fi
@@ -133,7 +151,7 @@ _port_in_use() {
             file_name=$(basename "$env_file" .env)
             [ "$file_name" = "$name" ] && continue
             local p
-            p=$(grep -E '^OCM_PORT=' "$env_file" 2>/dev/null | cut -d= -f2 | tr -d '[:space:]')
+            p=$(_get_port "$file_name")
             if [ "$p" = "$port" ]; then
                 echo "$file_name"
                 return 0
@@ -186,7 +204,7 @@ _docker_run() {
     local tag
     tag="$(_effective_tag "$name")"
     local port
-    port=$(grep -E '^OCM_PORT=' "$OCM_DIR/containers/${name}.env" | cut -d= -f2 | tr -d '[:space:]')
+    port=$(_get_port "$name")
     local env_file
     env_file="$(_filtered_env_file "$name")"
 
@@ -197,7 +215,8 @@ _docker_run() {
         docker pull "$image" || _die "Failed to pull image '$image'."
     fi
 
-    if ! docker run -d \
+    local err
+    if ! err=$(docker run -d \
         --name "$cname" \
         --hostname "$name" \
         -p "${port}:18789" \
@@ -206,9 +225,9 @@ _docker_run() {
         -v "${OCM_CONTAINER_PREFIX}-${name}-auth:/home/node/.config/openclaw" \
         --env-file "$env_file" \
         --restart unless-stopped \
-        "$image" >/dev/null 2>&1; then
+        "$image" 2>&1); then
         docker rm "$cname" >/dev/null 2>&1 || true
-        _die "Failed to start container '$name' on port ${port}. The port may be in use. Try: ${SCRIPT_NAME} env $name"
+        _die "Failed to start container '$name': ${err}"
     fi
 }
 
@@ -250,6 +269,7 @@ cmd_create() {
     fi
 
     tag="${tag:-$OCM_DEFAULT_TAG}"
+    _validate_tag "$tag"
 
     local gateway_token
     gateway_token=$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 32 || true)
@@ -316,7 +336,7 @@ cmd_start() {
     esac
 
     local port
-    port=$(grep -E '^OCM_PORT=' "$OCM_DIR/containers/${name}.env" | cut -d= -f2 | tr -d '[:space:]')
+    port=$(_get_port "$name")
     _success "Started container '$name' on port ${port}."
 }
 
@@ -361,7 +381,7 @@ cmd_restart() {
     _docker_run "$name"
 
     local port
-    port=$(grep -E '^OCM_PORT=' "$OCM_DIR/containers/${name}.env" | cut -d= -f2 | tr -d '[:space:]')
+    port=$(_get_port "$name")
     _success "Restarted container '$name' on port ${port}."
 }
 
@@ -379,6 +399,10 @@ cmd_upgrade() {
 
     _require_docker
 
+    if [ -n "$tag" ]; then
+        _validate_tag "$tag"
+    fi
+
     if $all; then
         [ ${#names[@]} -gt 0 ] && _die "Cannot combine --all with container names."
         for env_file in "$OCM_DIR/containers"/*.env; do
@@ -395,18 +419,38 @@ cmd_upgrade() {
         _require_config "$name"
     done
 
-    local pull_tag="${tag:-$OCM_DEFAULT_TAG}"
-    _info "Pulling image ${OCM_IMAGE}:${pull_tag}..."
-    docker pull "${OCM_IMAGE}:${pull_tag}" || _die "Failed to pull image."
-    _success "Image pulled."
+    local pull_tags=()
+    if [ -n "$tag" ]; then
+        pull_tags+=("$tag")
+    else
+        for name in "${names[@]}"; do
+            local t
+            t="$(_effective_tag "$name")"
+            local already=false
+            for existing in "${pull_tags[@]+"${pull_tags[@]}"}"; do
+                [ "$existing" = "$t" ] && { already=true; break; }
+            done
+            $already || pull_tags+=("$t")
+        done
+    fi
+
+    for pull_tag in "${pull_tags[@]}"; do
+        _info "Pulling image ${OCM_IMAGE}:${pull_tag}..."
+        docker pull "${OCM_IMAGE}:${pull_tag}" || _die "Failed to pull image ${OCM_IMAGE}:${pull_tag}."
+    done
+    _success "Image(s) pulled."
 
     for name in "${names[@]}"; do
         local cname
         cname="$(_container_name "$name")"
 
         if [ -n "$tag" ]; then
-            sed -i.bak "s/^OCM_TAG=.*/OCM_TAG=${tag}/" "$OCM_DIR/containers/${name}.env"
-            rm -f "$OCM_DIR/containers/${name}.env.bak"
+            local env_file="$OCM_DIR/containers/${name}.env"
+            local tmp
+            tmp=$(mktemp)
+            _TMP_FILES+=("$tmp")
+            sed "s|^OCM_TAG=.*|OCM_TAG=${tag}|" "$env_file" > "$tmp"
+            mv "$tmp" "$env_file"
         fi
 
         local state
@@ -455,6 +499,7 @@ cmd_logs() {
     local args=(--tail "$tail")
     $follow && args+=(--follow)
 
+    _cleanup
     exec docker logs "${args[@]}" "$cname"
 }
 
@@ -527,6 +572,7 @@ cmd_cli() {
     local cname
     cname="$(_container_name "$name")"
 
+    _cleanup
     if [ $# -eq 0 ]; then
         exec docker exec -it "$cname" /bin/bash
     elif [ "$1" = "--raw" ]; then
@@ -555,7 +601,7 @@ cmd_status() {
     local tag
     tag=$(_effective_tag "$name")
     local port
-    port=$(grep -E '^OCM_PORT=' "$OCM_DIR/containers/${name}.env" | cut -d= -f2 | tr -d '[:space:]')
+    port=$(_get_port "$name")
 
     local state
     state=$(_container_state "$name")
@@ -629,23 +675,22 @@ cmd_list() {
         local state
         state=$(_container_state "$name")
         local port
-        port=$(grep -E '^OCM_PORT=' "$OCM_DIR/containers/${name}.env" | cut -d= -f2 | tr -d '[:space:]')
+        port=$(_get_port "$name")
         local tag
         tag=$(_effective_tag "$name")
         local health="-"
 
-        local status_str
+        local status_text color
         case "$state" in
-            running)
-                status_str="${GREEN}running${RESET}"
-                ;;
-            restarting)
-                status_str="${YELLOW}restarting${RESET}"
-                ;;
-            exited)   status_str="${RED}stopped${RESET}" ;;
-            absent)   status_str="${DIM}not created${RESET}" ;;
-            *)        status_str="$state" ;;
+            running)    status_text="running";     color="$GREEN" ;;
+            restarting) status_text="restarting";   color="$YELLOW" ;;
+            exited)     status_text="stopped";      color="$RED" ;;
+            absent)     status_text="not created";  color="$DIM" ;;
+            *)          status_text="$state";       color="" ;;
         esac
+        local status_str
+        status_str=$(printf "%-12s" "$status_text")
+        [ -n "$color" ] && status_str="${color}${status_str}${RESET}"
 
         if [ "$state" != "absent" ] && [ "$state" != "exited" ]; then
             local cname
@@ -653,7 +698,7 @@ cmd_list() {
             health=$(docker inspect --format '{{.State.Health.Status}}' "$cname" 2>/dev/null) || health="-"
         fi
 
-        printf "  %-16s %-22b %-8s %-20s %-10s\n" "$name" "$status_str" "$port" "$tag" "$health"
+        printf "  %-16s %b %-8s %-20s %-10s\n" "$name" "$status_str" "$port" "$tag" "$health"
     done
     printf "\n"
 }
@@ -696,8 +741,15 @@ cmd_rm() {
     fi
 
     if $volumes; then
-        printf "${YELLOW}This will permanently delete all data for '$name'. Continue? [y/N]${RESET} "
-        read -r confirm
+        local confirm="n"
+        if $force; then
+            confirm="y"
+        elif [ -t 0 ]; then
+            printf "${YELLOW}This will permanently delete all data for '$name'. Continue? [y/N]${RESET} "
+            read -r confirm
+        else
+            _warn "Non-interactive shell: use --force to delete volumes without confirmation."
+        fi
         if [[ "$confirm" =~ ^[Yy]$ ]]; then
             docker volume rm "${OCM_CONTAINER_PREFIX}-${name}-config" 2>/dev/null || true
             docker volume rm "${OCM_CONTAINER_PREFIX}-${name}-workspace" 2>/dev/null || true
@@ -730,6 +782,7 @@ cmd_env() {
 
 cmd_pull() {
     local tag="${1:-$OCM_DEFAULT_TAG}"
+    _validate_tag "$tag"
     _require_docker
 
     _info "Pulling ${OCM_IMAGE}:${tag}..."
@@ -740,11 +793,11 @@ cmd_pull() {
         printf "Set '${tag}' as the default tag? [y/N] "
         read -r confirm
         if [[ "$confirm" =~ ^[Yy]$ ]]; then
-            if [[ "$OSTYPE" == "darwin"* ]]; then
-                sed -i '' "s/^OCM_DEFAULT_TAG=.*/OCM_DEFAULT_TAG=${tag}/" "$OCM_DIR/ocm.conf"
-            else
-                sed -i "s/^OCM_DEFAULT_TAG=.*/OCM_DEFAULT_TAG=${tag}/" "$OCM_DIR/ocm.conf"
-            fi
+            local tmp
+            tmp=$(mktemp)
+            _TMP_FILES+=("$tmp")
+            sed "s|^OCM_DEFAULT_TAG=.*|OCM_DEFAULT_TAG=${tag}|" "$OCM_DIR/ocm.conf" > "$tmp"
+            mv "$tmp" "$OCM_DIR/ocm.conf"
             _success "Default tag set to '${tag}'."
         fi
     fi

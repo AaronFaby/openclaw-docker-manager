@@ -2,7 +2,7 @@
 
 ## Project overview
 
-A single-file bash CLI (`ocm`, ~800 lines) for managing multiple OpenClaw Docker containers on a host. No external dependencies beyond Docker.
+A single-file bash CLI (`ocm`, ~880 lines) for managing multiple OpenClaw Docker containers on a host. No external dependencies beyond Docker.
 
 ## Architecture
 
