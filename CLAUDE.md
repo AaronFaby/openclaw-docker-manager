@@ -2,7 +2,7 @@
 
 ## Project overview
 
-A single-file bash CLI (`ocm`, ~770 lines) for managing multiple OpenClaw Docker containers on a host. No external dependencies beyond Docker.
+A single-file bash CLI (`ocm`, ~800 lines) for managing multiple OpenClaw Docker containers on a host. No external dependencies beyond Docker.
 
 ## Architecture
 
@@ -33,6 +33,7 @@ The workspace mount is nested inside the config mount. Docker handles this corre
 - The script resolves its own location following symlinks (`_ocm_dir`), so it works when symlinked into `$PATH`.
 - The "restarting" Docker state must be handled alongside "running" in all lifecycle commands (start, stop, restart, upgrade, rm, status, list, cli).
 - `_docker_run` is the single source of truth for the `docker run` command, used by start, restart, and upgrade.
+- `cmd_setup` runs a one-off interactive container (`docker run -it --rm`) with the same volumes to configure OpenClaw before first start. The gateway crashes without this initial setup.
 
 ## Testing
 
@@ -40,6 +41,7 @@ No automated tests. Validate changes manually:
 
 ```bash
 ocm create test --port 19100
+ocm setup test
 ocm start test
 ocm list
 ocm status test
@@ -50,7 +52,7 @@ ocm upgrade test
 ocm rm test --force --volumes
 ```
 
-The container will be in "restarting" state unless configured with valid API keys via `ocm env <name>`.
+The container will be in "restarting" state unless `ocm setup <name>` has been run first.
 
 ## Gotchas
 

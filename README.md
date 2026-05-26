@@ -21,6 +21,7 @@ chmod +x ocm
 # Create and configure a container
 ./ocm create main
 ./ocm env main          # Set your API keys (ANTHROPIC_API_KEY, etc.)
+./ocm setup main        # Interactive OpenClaw setup (first time only)
 ./ocm start main
 
 # Check status
@@ -35,6 +36,7 @@ chmod +x ocm
 
 ```bash
 ocm create <name> [--tag TAG] [--port PORT]   # Create a container config
+ocm setup <name>                               # Interactive OpenClaw setup
 ocm start <name>                               # Start a container
 ocm stop <name>                                # Stop a container
 ocm restart <name>                             # Restart a container

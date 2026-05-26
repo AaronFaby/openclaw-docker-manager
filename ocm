@@ -24,14 +24,14 @@ _supports_color() {
 }
 
 if _supports_color; then
-    readonly RED='\033[0;31m'
-    readonly GREEN='\033[0;32m'
-    readonly YELLOW='\033[0;33m'
-    readonly BLUE='\033[0;34m'
-    readonly CYAN='\033[0;36m'
-    readonly BOLD='\033[1m'
-    readonly DIM='\033[2m'
-    readonly RESET='\033[0m'
+    readonly RED=$'\033[0;31m'
+    readonly GREEN=$'\033[0;32m'
+    readonly YELLOW=$'\033[0;33m'
+    readonly BLUE=$'\033[0;34m'
+    readonly CYAN=$'\033[0;36m'
+    readonly BOLD=$'\033[1m'
+    readonly DIM=$'\033[2m'
+    readonly RESET=$'\033[0m'
 else
     readonly RED='' GREEN='' YELLOW='' BLUE='' CYAN='' BOLD='' DIM='' RESET=''
 fi
@@ -251,6 +251,9 @@ cmd_create() {
 
     tag="${tag:-$OCM_DEFAULT_TAG}"
 
+    local gateway_token
+    gateway_token=$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 32 || true)
+
     cat > "$OCM_DIR/containers/${name}.env" <<EOF
 # Container configuration for: ${name}
 # Managed by ${SCRIPT_NAME} - edit with: ${SCRIPT_NAME} env ${name}
@@ -258,6 +261,9 @@ cmd_create() {
 # --- OCM internal (do not remove) ---
 OCM_PORT=${port}
 OCM_TAG=${tag}
+
+# --- Gateway auth (auto-generated) ---
+OPENCLAW_GATEWAY_TOKEN=${gateway_token}
 
 # --- User environment variables ---
 # ANTHROPIC_API_KEY=
@@ -271,8 +277,10 @@ EOF
     docker volume create "${OCM_CONTAINER_PREFIX}-${name}-auth" >/dev/null
 
     _success "Created container '$name' (port ${port}, tag ${tag})"
-    _info "Edit environment: ${SCRIPT_NAME} env ${name}"
-    _info "Start container:  ${SCRIPT_NAME} start ${name}"
+    _info "Next steps:"
+    _info "  1. Set API keys:  ${SCRIPT_NAME} env ${name}"
+    _info "  2. Run setup:     ${SCRIPT_NAME} setup ${name}"
+    _info "  3. Start:         ${SCRIPT_NAME} start ${name}"
 }
 
 cmd_start() {
@@ -448,6 +456,57 @@ cmd_logs() {
     $follow && args+=(--follow)
 
     exec docker logs "${args[@]}" "$cname"
+}
+
+_docker_run_interactive() {
+    local name="$1"
+    shift
+    local tag
+    tag="$(_effective_tag "$name")"
+    local image="${OCM_IMAGE}:${tag}"
+    local env_file
+    env_file="$(_filtered_env_file "$name")"
+
+    if ! docker image inspect "$image" >/dev/null 2>&1; then
+        _info "Image '$image' not found locally, pulling..."
+        docker pull "$image" || _die "Failed to pull image '$image'."
+    fi
+
+    docker run -it --rm \
+        --name "${OCM_CONTAINER_PREFIX}-${name}-tmp" \
+        -v "${OCM_CONTAINER_PREFIX}-${name}-config:/home/node/.openclaw" \
+        -v "${OCM_CONTAINER_PREFIX}-${name}-workspace:/home/node/.openclaw/workspace" \
+        -v "${OCM_CONTAINER_PREFIX}-${name}-auth:/home/node/.config/openclaw" \
+        --env-file "$env_file" \
+        "$image" \
+        "$@"
+}
+
+cmd_setup() {
+    local name="${1:-}"
+    [ -z "$name" ] && _die "Usage: ${SCRIPT_NAME} setup <name>"
+    _validate_name "$name"
+    _require_docker
+    _require_config "$name"
+
+    _info "Running interactive setup for '$name'..."
+    _docker_run_interactive "$name" node openclaw.mjs setup
+    _success "Setup complete for '$name'. Start it with: ${SCRIPT_NAME} start $name"
+}
+
+cmd_run() {
+    local name="${1:-}"
+    [ -z "$name" ] && _die "Usage: ${SCRIPT_NAME} run <name> [cmd...]"
+    _validate_name "$name"
+    shift
+    _require_docker
+    _require_config "$name"
+
+    if [ $# -eq 0 ]; then
+        _docker_run_interactive "$name" /bin/bash
+    else
+        _docker_run_interactive "$name" "$@"
+    fi
 }
 
 cmd_cli() {
@@ -700,6 +759,7 @@ ${BOLD}Usage:${RESET}
 
 ${BOLD}Container Lifecycle:${RESET}
   create <name> [--tag TAG] [--port PORT]   Create a new container configuration
+  setup <name>                              Run interactive OpenClaw setup
   start <name>                              Start a container
   stop <name>                               Stop a container
   restart <name>                            Restart a container
@@ -709,7 +769,8 @@ ${BOLD}Management:${RESET}
   list, ls                                  List all managed containers
   status [name]                             Show container status
   logs <name> [-f] [-n LINES]              View container logs
-  cli <name> [--raw] [cmd...]              Execute commands in a container
+  run <name> [cmd...]                       Run a one-off interactive container
+  cli <name> [--raw] [cmd...]              Execute commands in a running container
   env <name>                                Edit container environment variables
 
 ${BOLD}Image:${RESET}
@@ -724,6 +785,7 @@ ${BOLD}Other:${RESET}
 ${BOLD}Examples:${RESET}
   ${SCRIPT_NAME} create main                        Create container 'main' with defaults
   ${SCRIPT_NAME} env main                           Set API keys and environment
+  ${SCRIPT_NAME} setup main                         Run interactive OpenClaw setup
   ${SCRIPT_NAME} start main                         Start the container
   ${SCRIPT_NAME} cli main                           Open a shell in the container
   ${SCRIPT_NAME} cli main configure                 Run 'openclaw configure' inside
@@ -748,11 +810,13 @@ main() {
 
     case "$cmd" in
         create)            cmd_create "$@" ;;
+        setup)             cmd_setup "$@" ;;
         start)             cmd_start "$@" ;;
         stop)              cmd_stop "$@" ;;
         restart)           cmd_restart "$@" ;;
         upgrade)           cmd_upgrade "$@" ;;
         logs)              cmd_logs "$@" ;;
+        run)               cmd_run "$@" ;;
         cli|exec|shell)    cmd_cli "$@" ;;
         status)            cmd_status "$@" ;;
         list|ls)           cmd_list "$@" ;;
