@@ -2,7 +2,7 @@
 
 ## Project overview
 
-A single-file bash CLI (`ocm`, ~880 lines) for managing multiple OpenClaw Docker containers on a host. No external dependencies beyond Docker.
+A single-file bash CLI (`ocm`, ~920 lines) for managing multiple OpenClaw Docker containers on a host. No external dependencies beyond Docker.
 
 ## Architecture
 
@@ -31,7 +31,7 @@ The workspace mount is nested inside the config mount. Docker handles this corre
 - All containers use `--restart unless-stopped` so they survive Docker daemon restarts.
 - Port auto-assignment scans existing `.env` files for the highest `OCM_PORT` and increments.
 - The script resolves its own location following symlinks (`_ocm_dir`), so it works when symlinked into `$PATH`.
-- The "restarting" Docker state must be handled alongside "running" in all lifecycle commands (start, stop, restart, upgrade, rm, status, list, cli).
+- The "restarting" Docker state must be handled alongside "running" in all lifecycle commands (start, stop, restart, upgrade, rm, status, list, cli, env).
 - `_docker_run` is the single source of truth for the `docker run` command, used by start, restart, and upgrade.
 - `cmd_setup` runs a one-off interactive container (`docker run -it --rm`) with the same volumes to configure OpenClaw before first start. The gateway crashes without this initial setup.
 
@@ -58,4 +58,4 @@ The container will be in "restarting" state unless `ocm setup <name>` has been r
 
 - Ports 18789 and 18790 may conflict with existing OpenClaw containers on the host. Use `--port` or `ocm env` to assign a free port.
 - `set -euo pipefail` is active. Empty arrays need special handling (see `_TMP_FILES` cleanup trap).
-- macOS `sed -i` requires `sed -i ''` vs Linux `sed -i`. The `cmd_pull` function handles this with an `$OSTYPE` check; `cmd_upgrade` uses `sed -i.bak` + `rm .bak` for portability.
+- macOS `sed -i` requires `sed -i ''` vs Linux `sed -i`. Both `cmd_pull` and `cmd_upgrade` sidestep this entirely by writing `sed` output to a `mktemp` file and `mv`-ing it into place (tracked in `_TMP_FILES` for cleanup).

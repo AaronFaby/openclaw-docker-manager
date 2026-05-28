@@ -68,15 +68,20 @@ CONF
 }
 
 _load_config() {
-    OCM_IMAGE="${OCM_IMAGE:-ghcr.io/aaronfaby/openclaw-custom}"
-    OCM_DEFAULT_TAG="${OCM_DEFAULT_TAG:-latest}"
-    OCM_PORT_START="${OCM_PORT_START:-18789}"
-    OCM_CONTAINER_PREFIX="${OCM_CONTAINER_PREFIX:-ocm}"
+    # ocm.conf is the single source of truth — wipe any inherited env vars
+    # so a stray export in the user's shell can't override the config.
+    unset OCM_IMAGE OCM_DEFAULT_TAG OCM_PORT_START OCM_CONTAINER_PREFIX
 
     if [ -f "$OCM_DIR/ocm.conf" ]; then
         # shellcheck source=/dev/null
         source "$OCM_DIR/ocm.conf"
     fi
+
+    # Fallbacks for keys the user may have removed from ocm.conf.
+    OCM_IMAGE="${OCM_IMAGE:-ghcr.io/aaronfaby/openclaw-custom}"
+    OCM_DEFAULT_TAG="${OCM_DEFAULT_TAG:-latest}"
+    OCM_PORT_START="${OCM_PORT_START:-18789}"
+    OCM_CONTAINER_PREFIX="${OCM_CONTAINER_PREFIX:-ocm}"
 }
 
 # ---- Validation ----
@@ -153,10 +158,21 @@ _port_in_use() {
             local p
             p=$(_get_port "$file_name")
             if [ "$p" = "$port" ]; then
-                echo "$file_name"
+                echo "container '$file_name'"
                 return 0
             fi
         done
+    fi
+    if command -v lsof >/dev/null 2>&1; then
+        if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+            echo "another process on this host"
+            return 0
+        fi
+    elif command -v nc >/dev/null 2>&1; then
+        if nc -z 127.0.0.1 "$port" >/dev/null 2>&1; then
+            echo "another process on this host"
+            return 0
+        fi
     fi
     return 1
 }
@@ -265,7 +281,9 @@ cmd_create() {
             _die "Port must be a number."
         fi
         local conflict
-        conflict=$(_port_in_use "$port" "$name") && _die "Port $port is already assigned to container '$conflict'."
+        if conflict=$(_port_in_use "$port" "$name"); then
+            _die "Port $port is already in use by $conflict."
+        fi
     fi
 
     tag="${tag:-$OCM_DEFAULT_TAG}"
@@ -517,8 +535,9 @@ _docker_run_interactive() {
         docker pull "$image" || _die "Failed to pull image '$image'."
     fi
 
+    # No --name: lets Docker assign a unique random name so concurrent
+    # `setup`/`run` invocations don't collide on a fixed "<name>-tmp" suffix.
     docker run -it --rm \
-        --name "${OCM_CONTAINER_PREFIX}-${name}-tmp" \
         -v "${OCM_CONTAINER_PREFIX}-${name}-config:/home/node/.openclaw" \
         -v "${OCM_CONTAINER_PREFIX}-${name}-workspace:/home/node/.openclaw/workspace" \
         -v "${OCM_CONTAINER_PREFIX}-${name}-auth:/home/node/.config/openclaw" \
@@ -572,15 +591,25 @@ cmd_cli() {
     local cname
     cname="$(_container_name "$name")"
 
+    # -i always (keep stdin open); -t only when both stdin/stdout are TTYs,
+    # so piped input (`ocm cli main cmd < input`) doesn't fail.
+    local tty_flags="-i"
+    if [ -t 0 ] && [ -t 1 ]; then
+        tty_flags="-it"
+    fi
+
     _cleanup
     if [ $# -eq 0 ]; then
+        if [ "$tty_flags" != "-it" ]; then
+            _die "Interactive shell requires a TTY. Pass a command or run from a terminal."
+        fi
         exec docker exec -it "$cname" /bin/bash
     elif [ "$1" = "--raw" ]; then
         shift
         [ $# -eq 0 ] && _die "Usage: ${SCRIPT_NAME} cli <name> --raw <command...>"
-        exec docker exec -it "$cname" "$@"
+        exec docker exec "$tty_flags" "$cname" "$@"
     else
-        exec docker exec -it "$cname" node openclaw.mjs "$@"
+        exec docker exec "$tty_flags" "$cname" node openclaw.mjs "$@"
     fi
 }
 
@@ -775,7 +804,7 @@ cmd_env() {
 
     local state
     state=$(_container_state "$name" 2>/dev/null) || state="absent"
-    if [ "$state" = "running" ]; then
+    if [ "$state" = "running" ] || [ "$state" = "restarting" ]; then
         _info "Restart the container for changes to take effect: ${SCRIPT_NAME} restart $name"
     fi
 }
@@ -790,6 +819,11 @@ cmd_pull() {
     _success "Image pulled: ${OCM_IMAGE}:${tag}"
 
     if [ "$tag" != "$OCM_DEFAULT_TAG" ]; then
+        if [ ! -t 0 ]; then
+            _info "Non-interactive shell: keeping default tag as '${OCM_DEFAULT_TAG}'. Edit ocm.conf to change it."
+            return 0
+        fi
+        local confirm
         printf "Set '${tag}' as the default tag? [y/N] "
         read -r confirm
         if [[ "$confirm" =~ ^[Yy]$ ]]; then
