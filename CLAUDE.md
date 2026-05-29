@@ -13,18 +13,19 @@ A single-file bash CLI (`ocm`, ~920 lines) for managing multiple OpenClaw Docker
 ## Docker resource naming
 
 - Containers: `ocm-<name>`
-- Volumes: `ocm-<name>-config`, `ocm-<name>-workspace`, `ocm-<name>-auth`
+- Volumes: `ocm-<name>-home`, `ocm-<name>-config`, `ocm-<name>-workspace`, `ocm-<name>-auth`
 - Image: `ghcr.io/aaronfaby/openclaw-custom` (configurable in `ocm.conf`)
 
 ## Volume mount mapping
 
 | Volume | Container path | Purpose |
 |---|---|---|
+| `ocm-<name>-home` | `/home/node` | Home dir for supporting utilities' config (everything not covered by a more specific mount) |
 | `ocm-<name>-config` | `/home/node/.openclaw` | Config and auth profiles |
 | `ocm-<name>-workspace` | `/home/node/.openclaw/workspace` | Session and workspace data |
 | `ocm-<name>-auth` | `/home/node/.config/openclaw` | Encryption keys for OAuth tokens |
 
-The workspace mount is nested inside the config mount. Docker handles this correctly — list workspace after config in `docker run` so the more specific mount overlays.
+The mounts are nested: `home` contains `config`/`auth`, and `config` contains `workspace`. Docker handles this correctly only if the mounts are listed parent-first in `docker run` (home → config → workspace → auth) so each more specific mount overlays the one above it. A fresh `home` volume is auto-populated from the image's baked-in `/home/node` contents on first run.
 
 ## Key design decisions
 

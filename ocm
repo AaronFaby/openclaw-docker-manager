@@ -236,6 +236,7 @@ _docker_run() {
         --name "$cname" \
         --hostname "$name" \
         -p "${port}:18789" \
+        -v "${OCM_CONTAINER_PREFIX}-${name}-home:/home/node" \
         -v "${OCM_CONTAINER_PREFIX}-${name}-config:/home/node/.openclaw" \
         -v "${OCM_CONTAINER_PREFIX}-${name}-workspace:/home/node/.openclaw/workspace" \
         -v "${OCM_CONTAINER_PREFIX}-${name}-auth:/home/node/.config/openclaw" \
@@ -310,6 +311,7 @@ OPENCLAW_GATEWAY_TOKEN=${gateway_token}
 # OPENCLAW_LOG_LEVEL=debug
 EOF
 
+    docker volume create "${OCM_CONTAINER_PREFIX}-${name}-home" >/dev/null
     docker volume create "${OCM_CONTAINER_PREFIX}-${name}-config" >/dev/null
     docker volume create "${OCM_CONTAINER_PREFIX}-${name}-workspace" >/dev/null
     docker volume create "${OCM_CONTAINER_PREFIX}-${name}-auth" >/dev/null
@@ -538,6 +540,7 @@ _docker_run_interactive() {
     # No --name: lets Docker assign a unique random name so concurrent
     # `setup`/`run` invocations don't collide on a fixed "<name>-tmp" suffix.
     docker run -it --rm \
+        -v "${OCM_CONTAINER_PREFIX}-${name}-home:/home/node" \
         -v "${OCM_CONTAINER_PREFIX}-${name}-config:/home/node/.openclaw" \
         -v "${OCM_CONTAINER_PREFIX}-${name}-workspace:/home/node/.openclaw/workspace" \
         -v "${OCM_CONTAINER_PREFIX}-${name}-auth:/home/node/.config/openclaw" \
@@ -677,7 +680,8 @@ cmd_status() {
         printf "  ${BOLD}Started:${RESET}    %s\n" "$started"
     fi
 
-    printf "  ${BOLD}Volumes:${RESET}    %s-config\n" "${OCM_CONTAINER_PREFIX}-${name}"
+    printf "  ${BOLD}Volumes:${RESET}    %s-home\n" "${OCM_CONTAINER_PREFIX}-${name}"
+    printf "              %s-config\n" "${OCM_CONTAINER_PREFIX}-${name}"
     printf "              %s-workspace\n" "${OCM_CONTAINER_PREFIX}-${name}"
     printf "              %s-auth\n" "${OCM_CONTAINER_PREFIX}-${name}"
     printf "\n"
@@ -780,6 +784,7 @@ cmd_rm() {
             _warn "Non-interactive shell: use --force to delete volumes without confirmation."
         fi
         if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            docker volume rm "${OCM_CONTAINER_PREFIX}-${name}-home" 2>/dev/null || true
             docker volume rm "${OCM_CONTAINER_PREFIX}-${name}-config" 2>/dev/null || true
             docker volume rm "${OCM_CONTAINER_PREFIX}-${name}-workspace" 2>/dev/null || true
             docker volume rm "${OCM_CONTAINER_PREFIX}-${name}-auth" 2>/dev/null || true

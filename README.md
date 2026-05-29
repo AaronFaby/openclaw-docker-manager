@@ -93,13 +93,16 @@ OPENAI_API_KEY=sk-...
 
 ## Data persistence
 
-Each container gets three Docker volumes that persist across restarts and upgrades:
+Each container gets four Docker volumes that persist across restarts and upgrades:
 
 | Volume | Container path | Contents |
 |---|---|---|
+| `ocm-<name>-home` | `/home/node` | Home directory — config for supporting utilities (everything not covered by a more specific volume below) |
 | `ocm-<name>-config` | `/home/node/.openclaw` | Configuration and auth profiles |
 | `ocm-<name>-workspace` | `/home/node/.openclaw/workspace` | Session and workspace data |
 | `ocm-<name>-auth` | `/home/node/.config/openclaw` | OAuth token encryption keys |
+
+The mounts are nested (`home` ⊃ `config` ⊃ `workspace`, and `home` ⊃ `auth`); Docker overlays the more specific volume on top of the more general one. A fresh `home` volume is auto-populated from the image's baked-in `/home/node` contents on first start.
 
 Volumes are **not** removed when you `ocm rm` a container unless you pass `--volumes`.
 
