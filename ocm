@@ -798,6 +798,25 @@ cmd_rm() {
     _success "Removed container '$name'."
 }
 
+_strip_env_quotes() {
+    # Strip a single pair of surrounding matching quotes from each KEY=value
+    # value. Docker's --env-file passes values through verbatim, so wrapping
+    # quotes end up inside the variable and break API calls. Returns 0 if the
+    # file was modified.
+    local file="$1" tmp
+    tmp=$(mktemp)
+    _TMP_FILES+=("$tmp")
+    sed -E \
+        -e 's/^([A-Za-z_][A-Za-z0-9_]*)="(.*)"$/\1=\2/' \
+        -e "s/^([A-Za-z_][A-Za-z0-9_]*)='(.*)'\$/\1=\2/" \
+        "$file" > "$tmp"
+    if cmp -s "$tmp" "$file"; then
+        return 1
+    fi
+    mv "$tmp" "$file"
+    return 0
+}
+
 cmd_env() {
     local name="${1:-}"
     [ -z "$name" ] && _die "Usage: ${SCRIPT_NAME} env <name>"
@@ -806,6 +825,10 @@ cmd_env() {
 
     local editor="${EDITOR:-vi}"
     "$editor" "$OCM_DIR/containers/${name}.env"
+
+    if _strip_env_quotes "$OCM_DIR/containers/${name}.env"; then
+        _warn "Stripped surrounding quotes from one or more values in ${name}.env (Docker passes them through literally)."
+    fi
 
     local state
     state=$(_container_state "$name" 2>/dev/null) || state="absent"

@@ -8,7 +8,7 @@ A single-file bash CLI (`ocm`, ~920 lines) for managing multiple OpenClaw Docker
 
 - `ocm` — the entire tool, a self-contained bash script
 - `ocm.conf` — global config (image, default tag, port range start, container prefix). Auto-created on first run.
-- `containers/<name>.env` — per-container config. Contains `OCM_PORT`, `OCM_TAG` (internal), and user environment variables (API keys etc). Lines prefixed `OCM_` are stripped before passing to Docker's `--env-file`.
+- `containers/<name>.env` — per-container config. Contains `OCM_PORT`, `OCM_TAG` (internal), and user environment variables (API keys etc). Lines prefixed `OCM_` are stripped before passing to Docker's `--env-file`. After `ocm env` edits the file, surrounding quotes are stripped from values (Docker's `--env-file` passes values verbatim, so quotes would leak into the variable and break API calls).
 
 ## Docker resource naming
 
@@ -59,4 +59,5 @@ The container will be in "restarting" state unless `ocm setup <name>` has been r
 
 - Ports 18789 and 18790 may conflict with existing OpenClaw containers on the host. Use `--port` or `ocm env` to assign a free port.
 - `set -euo pipefail` is active. Empty arrays need special handling (see `_TMP_FILES` cleanup trap).
-- macOS `sed -i` requires `sed -i ''` vs Linux `sed -i`. Both `cmd_pull` and `cmd_upgrade` sidestep this entirely by writing `sed` output to a `mktemp` file and `mv`-ing it into place (tracked in `_TMP_FILES` for cleanup).
+- macOS `sed -i` requires `sed -i ''` vs Linux `sed -i`. `cmd_pull`, `cmd_upgrade`, and `_strip_env_quotes` sidestep this entirely by writing `sed` output to a `mktemp` file and `mv`-ing it into place (tracked in `_TMP_FILES` for cleanup).
+- `--env-file` passes values verbatim — Docker does *not* interpret quotes. `cmd_env` calls `_strip_env_quotes` after editing to remove a single pair of surrounding matching quotes (`"..."` or `'...'`) from each value, warning when it does. Unbalanced/lone quotes are left intact as likely-intentional content.
