@@ -91,6 +91,8 @@ OPENAI_API_KEY=sk-...
 
 `OCM_PORT` and `OCM_TAG` are used by `ocm` internally. All other variables are passed to the container.
 
+Do not wrap values in quotes — Docker's `--env-file` passes values verbatim (it does not interpret quotes), so `ANTHROPIC_API_KEY="sk-ant-..."` would send the quotes as part of the key and break API calls. As a safeguard, `ocm env` automatically strips a pair of surrounding quotes from each value after you save.
+
 ## Data persistence
 
 Each container gets four Docker volumes that persist across restarts and upgrades:
