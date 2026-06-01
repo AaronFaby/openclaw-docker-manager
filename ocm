@@ -616,12 +616,60 @@ cmd_cli() {
     fi
 }
 
+cmd_status_all() {
+    local configs=()
+    for env_file in "$OCM_DIR/containers"/*.env; do
+        [ -f "$env_file" ] || continue
+        configs+=("$(basename "$env_file" .env)")
+    done
+
+    if [ ${#configs[@]} -eq 0 ]; then
+        _info "No containers managed by ${SCRIPT_NAME}. Run '${SCRIPT_NAME} create <name>' to get started."
+        return 0
+    fi
+
+    printf "\n"
+    printf "  ${BOLD}%-16s %-12s %-8s %-10s %s${RESET}\n" "NAME" "STATUS" "PORT" "HEALTH" "IP"
+
+    for name in "${configs[@]}"; do
+        local cname
+        cname="$(_container_name "$name")"
+        local state
+        state=$(_container_state "$name")
+        local port
+        port=$(_get_port "$name")
+
+        local status_text color
+        case "$state" in
+            running)    status_text="running";     color="$GREEN" ;;
+            restarting) status_text="restarting";   color="$YELLOW" ;;
+            exited)     status_text="stopped";      color="$RED" ;;
+            absent)     status_text="not created";  color="$DIM" ;;
+            *)          status_text="$state";       color="" ;;
+        esac
+        local status_str
+        status_str=$(printf "%-12s" "$status_text")
+        [ -n "$color" ] && status_str="${color}${status_str}${RESET}"
+
+        local health="-" ip="-"
+        if [ "$state" != "absent" ] && [ "$state" != "exited" ]; then
+            health=$(docker inspect --format '{{.State.Health.Status}}' "$cname" 2>/dev/null) || health="none"
+            [ -n "$health" ] || health="none"
+            ip=$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$cname" 2>/dev/null | tr -s ' ' | sed 's/ *$//')
+            [ -n "$ip" ] || ip="-"
+        fi
+
+        printf "  %-16s %b %-8s %-10s %s\n" "$name" "$status_str" "$port" "$health" "$ip"
+    done
+    printf "\n"
+}
+
 cmd_status() {
     local name="${1:-}"
     _require_docker
 
     if [ -z "$name" ]; then
-        cmd_list
+        cmd_status_all
         return
     fi
 
@@ -675,6 +723,10 @@ cmd_status() {
             *)         printf "  ${BOLD}Health:${RESET}     %s\n" "$health" ;;
         esac
 
+        local ip
+        ip=$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$cname" 2>/dev/null | tr -s ' ' | sed 's/ *$//')
+        [ -n "$ip" ] && printf "  ${BOLD}IP:${RESET}         %s\n" "$ip"
+
         local started
         started=$(docker inspect --format '{{.State.StartedAt}}' "$cname" 2>/dev/null)
         printf "  ${BOLD}Started:${RESET}    %s\n" "$started"
@@ -702,16 +754,13 @@ cmd_list() {
     fi
 
     printf "\n"
-    printf "  ${BOLD}%-16s %-12s %-8s %-20s %-10s${RESET}\n" "NAME" "STATUS" "PORT" "IMAGE TAG" "HEALTH"
+    printf "  ${BOLD}%-16s %-12s %-8s${RESET}\n" "NAME" "STATUS" "PORT"
 
     for name in "${configs[@]}"; do
         local state
         state=$(_container_state "$name")
         local port
         port=$(_get_port "$name")
-        local tag
-        tag=$(_effective_tag "$name")
-        local health="-"
 
         local status_text color
         case "$state" in
@@ -725,13 +774,7 @@ cmd_list() {
         status_str=$(printf "%-12s" "$status_text")
         [ -n "$color" ] && status_str="${color}${status_str}${RESET}"
 
-        if [ "$state" != "absent" ] && [ "$state" != "exited" ]; then
-            local cname
-            cname="$(_container_name "$name")"
-            health=$(docker inspect --format '{{.State.Health.Status}}' "$cname" 2>/dev/null) || health="-"
-        fi
-
-        printf "  %-16s %b %-8s %-20s %-10s\n" "$name" "$status_str" "$port" "$tag" "$health"
+        printf "  %-16s %b %-8s\n" "$name" "$status_str" "$port"
     done
     printf "\n"
 }
