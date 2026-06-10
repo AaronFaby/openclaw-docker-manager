@@ -16,7 +16,10 @@ _ocm_dir() {
     cd -P "$(dirname "$source")" && pwd
 }
 
-readonly OCM_DIR="$(_ocm_dir)"
+# Separate assignment from readonly: `readonly VAR=$(cmd)` masks the command
+# substitution's exit status, defeating errexit if _ocm_dir fails.
+OCM_DIR="$(_ocm_dir)"
+readonly OCM_DIR
 
 # ---- Color / Output ----
 _supports_color() {
@@ -65,6 +68,12 @@ CONF
         _info "Created default config at ocm.conf"
     fi
     mkdir -p "$OCM_DIR/containers"
+    # Env files hold API keys and the gateway token — keep them private,
+    # including files created before this was enforced.
+    for f in "$OCM_DIR/containers"/*.env; do
+        [ -f "$f" ] || continue
+        chmod 600 "$f"
+    done
 }
 
 _load_config() {
@@ -120,8 +129,11 @@ _validate_tag() {
 
 # ---- Env file helpers ----
 _get_port() {
+    # Echoes nothing if the line is missing — without the `|| true`, pipefail
+    # would silently kill the script on a corrupted env file. Callers that
+    # need a port must check for empty output.
     local name="$1"
-    grep -E '^OCM_PORT=' "$OCM_DIR/containers/${name}.env" | cut -d= -f2 | tr -d '[:space:]'
+    grep -E '^OCM_PORT=' "$OCM_DIR/containers/${name}.env" | cut -d= -f2 | tr -d '[:space:]' || true
 }
 
 # ---- Container name ----
@@ -221,6 +233,7 @@ _docker_run() {
     tag="$(_effective_tag "$name")"
     local port
     port=$(_get_port "$name")
+    [ -n "$port" ] || _die "OCM_PORT is missing from ${name}.env — re-add it (e.g. OCM_PORT=$(_next_available_port))."
     local env_file
     env_file="$(_filtered_env_file "$name")"
 
@@ -277,9 +290,15 @@ cmd_create() {
 
     if [ -z "$port" ]; then
         port=$(_next_available_port)
+        # _next_available_port only looks at .env files; skip past ports a
+        # non-ocm process is already listening on.
+        while _port_in_use "$port" "$name" >/dev/null; do
+            port=$((port + 1))
+            [ "$port" -le 65535 ] || _die "No free port found above ${OCM_PORT_START}."
+        done
     else
-        if ! [[ "$port" =~ ^[0-9]+$ ]]; then
-            _die "Port must be a number."
+        if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+            _die "Port must be a number between 1 and 65535."
         fi
         local conflict
         if conflict=$(_port_in_use "$port" "$name"); then
@@ -292,6 +311,7 @@ cmd_create() {
 
     local gateway_token
     gateway_token=$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 32 || true)
+    [ -n "$gateway_token" ] || _die "Failed to generate a gateway token (could not read /dev/urandom)."
 
     cat > "$OCM_DIR/containers/${name}.env" <<EOF
 # Container configuration for: ${name}
@@ -310,6 +330,7 @@ OPENCLAW_GATEWAY_TOKEN=${gateway_token}
 # OPENAI_API_KEY=
 # OPENCLAW_LOG_LEVEL=debug
 EOF
+    chmod 600 "$OCM_DIR/containers/${name}.env"
 
     docker volume create "${OCM_CONTAINER_PREFIX}-${name}-home" >/dev/null
     docker volume create "${OCM_CONTAINER_PREFIX}-${name}-config" >/dev/null
@@ -470,6 +491,11 @@ cmd_upgrade() {
             tmp=$(mktemp)
             _TMP_FILES+=("$tmp")
             sed "s|^OCM_TAG=.*|OCM_TAG=${tag}|" "$env_file" > "$tmp"
+            # The substitution is a no-op if the user removed the OCM_TAG line;
+            # re-add it so the container doesn't restart on the default tag.
+            if ! grep -qE '^OCM_TAG=' "$tmp"; then
+                printf 'OCM_TAG=%s\n' "$tag" >> "$tmp"
+            fi
             mv "$tmp" "$env_file"
         fi
 
@@ -481,11 +507,17 @@ cmd_upgrade() {
             docker rm "$cname" >/dev/null 2>&1 || true
         fi
 
-        _docker_run "$name"
-
         local effective
         effective=$(_effective_tag "$name")
-        _success "Upgraded '$name' to ${OCM_IMAGE}:${effective}"
+
+        # Only start containers that were running — don't bring up ones the
+        # user deliberately stopped (or never started).
+        if [ "$state" = "running" ] || [ "$state" = "restarting" ]; then
+            _docker_run "$name"
+            _success "Upgraded '$name' to ${OCM_IMAGE}:${effective}"
+        else
+            _success "Upgraded '$name' to ${OCM_IMAGE}:${effective} (left stopped — start with '${SCRIPT_NAME} start $name')"
+        fi
     done
 }
 
@@ -804,16 +836,18 @@ cmd_rm() {
     local state
     state=$(_container_state "$name")
 
-    if [ "$state" = "running" ] || [ "$state" = "restarting" ]; then
-        if $force; then
-            docker stop "$cname" >/dev/null 2>&1 || true
-        else
-            _die "Container '$name' is running. Stop it first or use --force."
-        fi
-    fi
-
     if [ "$state" != "absent" ]; then
-        docker rm "$cname" >/dev/null 2>&1 || true
+        if [ "$state" = "running" ] || [ "$state" = "restarting" ]; then
+            $force || _die "Container '$name' is running. Stop it first or use --force."
+        fi
+        local rm_args=()
+        $force && rm_args+=(-f)
+        # Don't swallow failures (e.g. a paused container): removing the env
+        # file below would orphan a container ocm no longer knows about.
+        local err
+        if ! err=$(docker rm "${rm_args[@]+"${rm_args[@]}"}" "$cname" 2>&1); then
+            _die "Failed to remove container '$name': ${err}"
+        fi
     fi
 
     if $volumes; then
@@ -867,7 +901,9 @@ cmd_env() {
     _require_config "$name"
 
     local editor="${EDITOR:-vi}"
-    "$editor" "$OCM_DIR/containers/${name}.env"
+    # EDITOR may carry arguments (e.g. "code -w"); let it word-split.
+    # shellcheck disable=SC2086
+    $editor "$OCM_DIR/containers/${name}.env"
 
     if _strip_env_quotes "$OCM_DIR/containers/${name}.env"; then
         _warn "Stripped surrounding quotes from one or more values in ${name}.env (Docker passes them through literally)."
@@ -902,6 +938,9 @@ cmd_pull() {
             tmp=$(mktemp)
             _TMP_FILES+=("$tmp")
             sed "s|^OCM_DEFAULT_TAG=.*|OCM_DEFAULT_TAG=${tag}|" "$OCM_DIR/ocm.conf" > "$tmp"
+            if ! grep -qE '^OCM_DEFAULT_TAG=' "$tmp"; then
+                printf 'OCM_DEFAULT_TAG=%s\n' "$tag" >> "$tmp"
+            fi
             mv "$tmp" "$OCM_DIR/ocm.conf"
             _success "Default tag set to '${tag}'."
         fi

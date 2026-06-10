@@ -30,7 +30,9 @@ The mounts are nested: `home` contains `config`/`auth`, and `config` contains `w
 ## Key design decisions
 
 - All containers use `--restart unless-stopped` so they survive Docker daemon restarts.
-- Port auto-assignment scans existing `.env` files for the highest `OCM_PORT` and increments.
+- Port auto-assignment scans existing `.env` files for the highest `OCM_PORT` and increments, then skips past ports another host process is listening on (`_port_in_use` via lsof/nc).
+- `.env` files hold secrets, so they are created `0600` and `_ensure_init` re-tightens permissions on every run.
+- `upgrade` only restarts containers that were running/restarting; deliberately stopped (or never-started) ones stay down and pick up the new image on next start.
 - The script resolves its own location following symlinks (`_ocm_dir`), so it works when symlinked into `$PATH`.
 - The "restarting" Docker state must be handled alongside "running" in all lifecycle commands (start, stop, restart, upgrade, rm, status, list, cli, env).
 - `_docker_run` is the single source of truth for the `docker run` command, used by start, restart, and upgrade.

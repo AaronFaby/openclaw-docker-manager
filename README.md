@@ -49,6 +49,7 @@ ocm rm <name> [--volumes] [--force]            # Remove a container
 ocm list                                       # List all containers
 ocm status [name]                              # Show detailed container status
 ocm logs <name> [-f] [-n LINES]                # View container logs
+ocm run <name> [cmd...]                        # One-off interactive container (same volumes/env)
 ocm cli <name> [cmd...]                        # Shell or run openclaw commands
 ocm env <name>                                 # Edit environment variables
 ```
@@ -91,6 +92,8 @@ OPENAI_API_KEY=sk-...
 
 `OCM_PORT` and `OCM_TAG` are used by `ocm` internally. All other variables are passed to the container.
 
+Env files hold secrets (API keys, the gateway token), so they are created with `0600` permissions.
+
 Do not wrap values in quotes — Docker's `--env-file` passes values verbatim (it does not interpret quotes), so `ANTHROPIC_API_KEY="sk-ant-..."` would send the quotes as part of the key and break API calls. As a safeguard, `ocm env` automatically strips a pair of surrounding quotes from each value after you save.
 
 ## Data persistence
@@ -110,7 +113,7 @@ Volumes are **not** removed when you `ocm rm` a container unless you pass `--vol
 
 ## Upgrading containers
 
-Upgrades pull the latest image, stop the container, remove it, and recreate it with the same configuration and volumes — your data is preserved:
+Upgrades pull the latest image, stop the container, remove it, and recreate it with the same configuration and volumes — your data is preserved. Containers that were stopped stay stopped and use the new image on their next start:
 
 ```bash
 ocm upgrade main           # Upgrade a single container
@@ -129,7 +132,7 @@ ocm cli main --raw env        # Run an arbitrary command
 
 ## Multiple containers
 
-Containers are automatically assigned incrementing ports starting from `OCM_PORT_START` (default 18789):
+Containers are automatically assigned incrementing ports starting from `OCM_PORT_START` (default 18789), skipping ports that another process on the host is already listening on:
 
 ```bash
 ocm create production              # Port 18789
@@ -141,4 +144,4 @@ ocm create pinned --tag oc-2026.5.22  # Pinned image version
 ## Requirements
 
 - Docker
-- Bash 4+
+- Bash 3.2+
